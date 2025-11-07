@@ -28,7 +28,7 @@ import wandb
 
 def train_step(model, data_loader, device):
     acc_loss = 0.0
-    
+
     requires_grad_sync = pgm.process_group_manager.cp_dp_world_size > 1
     for i in range(data_loader.grad_acc_steps):
         # get the next batch
@@ -47,7 +47,7 @@ def train_step(model, data_loader, device):
         target_ids = target_ids.reshape(-1)
         outputs = outputs.view(seq_len*batch_size, -1)
         loss = F.cross_entropy(outputs, target_ids, reduction='mean') / data_loader.grad_acc_steps
-        
+
         loss.backward()
 
         acc_loss += loss.item()
@@ -61,7 +61,7 @@ if __name__ == "__main__":
 
     with open(args.config, "r") as f:
         config = json.load(f)
-    
+
     os.environ["OMP_NUM_THREADS"] = config["environment"]["OMP_NUM_THREADS"]
     os.environ["TOKENIZERS_PARALLELISM"] = config["environment"]["TOKENIZERS_PARALLELISM"]
     os.environ["FLASH_ATTEN"] = config["environment"]["FLASH_ATTEN"]
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
 
     backend = "gloo" if config["distributed"]["use_cpu"] else "nccl"
-    
+
     assert config["training"]["seq_length"] % config["distributed"]["cp_size"] == 0, "seq_length must be divisible by cp_size for Context Parallelism"
     assert world_size == config["distributed"]["tp_size"] * config["distributed"]["pp_size"] * config["distributed"]["dp_size"] * config["distributed"]["cp_size"], "world_size must be equal to tp_size * pp_size * dp_size * cp_size"
 
@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
     print(f"init dataloader time: {time.time()-start_time:.2f}s", is_print_rank=is_wandb_rank)
     tokens_per_step = data_loader.global_batch_size * config["training"]["seq_length"]
-    
+
     if pgm.process_group_manager.global_rank == 0:
         print("Tokens per step:", to_readable_format(tokens_per_step), is_print_rank=is_wandb_rank)
 
@@ -188,18 +188,18 @@ if __name__ == "__main__":
         model = apply_context_parallel(model)
 
     model.to(dtype).to(device)
-    
+
     if pgm.process_group_manager.dp_world_size > 1:
         model = DataParallelBucket(model)
-    
+
     print(f"init model parallel time: {time.time()-start_time:.2f}s", is_print_rank=is_wandb_rank)
-    
+
     model.train()
     num_params = get_num_params(model)
     print(f"Number of parameters: {to_readable_format(num_params)}", is_print_rank=is_wandb_rank)
-    
+
     tensor_shapes = (data_loader.micro_batch_size, data_loader.seq_length_per_gpu, model_config.hidden_size)
-    
+
     extra_args = dict()
     if config["model"]["use_fused_adam"]:
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
@@ -207,19 +207,19 @@ if __name__ == "__main__":
         extra_args = dict(fused=True) if use_fused else dict()
 
     optimizer = AdamW(model.parameters(), lr=config["training"]["learning_rate"], **extra_args)
-    
+
     checkpoint_manager = CheckpointManager()
 
     trained_tokens, step = 0, 0
     if config["checkpoint"]["load_path"]:
         step, trained_tokens = checkpoint_manager.load_checkpoint(model, optimizer, config["checkpoint"]["load_path"])
-    
+
     dist.barrier()
-    
+
     while config["training"]["max_tokens"] is None or trained_tokens < config["training"]["max_tokens"]:
         step_start_time = time.time()
         optimizer.zero_grad()
-        
+
         if pgm.process_group_manager.pp_world_size > 1:
             if config["distributed"]["pp_engine"] == "afab":
                 loss = train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype)
@@ -229,13 +229,13 @@ if __name__ == "__main__":
                 raise ValueError(f"Invalid pipeline parallel engine: {config['distributed']['pp_engine']}")
         else:
             loss = train_step(model, data_loader, device)
-            
+
         loss = average_loss_across_dp_cp_ranks(loss, device)
-        
+
         optimizer.step()
         trained_tokens += tokens_per_step
         step += 1
-        
+
         if hasattr(model, 'reset'):
             model.reset()
 
@@ -243,7 +243,7 @@ if __name__ == "__main__":
         tokens_per_second = tokens_per_step / step_duration
         tokens_per_second_per_gpu = tokens_per_second / world_size
         mfu = get_mfu(tokens_per_second_per_gpu, num_params, model_config)
-        
+
         if is_wandb_rank:
             print(
                 f"[rank {pgm.process_group_manager.global_rank}] "
@@ -257,7 +257,7 @@ if __name__ == "__main__":
                 f"Memory usage: {torch.cuda.memory_reserved() / 1e9:6.2f}GB",
                 is_print_rank=is_wandb_rank
             )
-        
+
             if config["logging"]["use_wandb"]:
                 wandb.log({
                     "loss": loss,
@@ -268,13 +268,13 @@ if __name__ == "__main__":
                     "memory_usage": torch.cuda.memory_reserved() / 1e9,
                     "trained_tokens": trained_tokens
                 })
-        
+
         if step % config["checkpoint"]["save_frequency"] == 0:
             checkpoint_manager.save_checkpoint(model, optimizer, step, trained_tokens, config["checkpoint"]["save_dir"]+f"/{step}")
-        
+
         if step >= config["training"]["total_train_steps"]:
             break
-    
+
     if is_wandb_rank and config["logging"]["use_wandb"]:
         wandb.finish()
 

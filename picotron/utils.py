@@ -24,7 +24,7 @@ def set_all_seed(seed):
     for module in [random, np.random]: module.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    
+
 def to_readable_format(num, precision=2):
     if num >= 1e12:
         return f"{num / 1e12:.{precision}f}T"
@@ -50,16 +50,16 @@ def get_mfu(tokens_per_second, num_params, model_config, theoretical_flops = 989
 
 def get_num_params(model):
     """Calculate total number of parameters accounting for tensor parallelism and pipeline parallelism.
-    
+
     For TP: Parameters in attention/mlp/embed/final_proj are sharded, so multiply by tp_world_size
     For PP: Need to gather parameter counts across pipeline stages
     For DP: Parameters are replicated, so only count once
-    
+
     Note: 
     FSDP: Parameters are sharded across data parallel ranks
     """
     tp_world_size = pgm.process_group_manager.tp_world_size
-    
+
     # Count parameters in current PP rank
     local_num_params = 0
     for name, param in model.named_parameters():
@@ -70,25 +70,25 @@ def get_num_params(model):
         else:
             # Parameters replicated across TP ranks (layer norm, biases)
             local_num_params += param.numel()
-            
+
     # Gather parameter counts from all PP ranks
     param_counts = torch.tensor(local_num_params, device='cuda')
-    
+
     # Sum up parameters across all PP ranks
     dist.all_reduce(param_counts, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.pp_group)
-    
+
     return param_counts.item()
-    
+
 def assert_no_meta_tensors(model):
     meta_tensors = []
     for name, param in model.named_parameters():
         if param.device == torch.device("meta"):
             meta_tensors.append(f"Parameter '{name}' with shape {param.shape}")
-    
+
     for name, buffer in model.named_buffers():
         if buffer.device == torch.device("meta"):
             meta_tensors.append(f"Buffer '{name}' with shape {buffer.shape}")
-    
+
     assert len(meta_tensors) == 0, f"Found {len(meta_tensors)} meta tensors:\n" + "\n".join(meta_tensors)
 
 def average_loss_across_dp_cp_ranks(loss, device):
